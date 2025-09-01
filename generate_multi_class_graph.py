@@ -103,22 +103,113 @@ from torch_geometric.utils import to_networkx
 #     return file
 
 # --- 1. 设置生成图的参数 ---
+# === 批次采样配置 ===
+# 用户可根据需要调整以下参数：
 n_nodes = 100  # 节点数
 n_features = 50  # 特征维度
-n_samples = 5  # 采样次数
+n_samples = 2000  # 总采样次数 - 可设置为更大的值如10000, 50000等
+batch_size = 50  # 批次大小 - 建议根据内存情况调整(10-100)
 connection_density = 0.8  # 连接密度
 inter_class_boost = 0.3  # 类间连接增强参数
-# 从[-1,1]均匀分布采样theta值
-theta_values = np.random.uniform(-0.6, 0.5, n_samples)
-connection_density_values = np.random.uniform(0.5, 0.7, n_samples)  # 连接密度
-inter_class_boost_values = np.random.uniform(0.1, 0.2, n_samples)  # 类间连接增强参数
-n_node = np.random.randint(80,300)  # 节点数
-n_features = np.random.randint(60,256)
-# 从[3,8]均匀分布采样类别数
-num_classes_values = [random.randint(3, 8) for _ in range(n_samples)]
 
-print(f"Sampled theta values: {theta_values}")
-print(f"Sampled num_classes values: {num_classes_values}")
+# 批次采样优势：
+# 1. 支持大数量采样（如10000+样本）而不会内存溢出
+# 2. 提供实时进度显示和统计信息
+# 3. 自动内存管理和垃圾回收
+# 4. 错误处理和恢复机制
+# 5. 可重现的随机种子设置
+
+# 计算批次数量
+n_batches = (n_samples + batch_size - 1) // batch_size  # 向上取整
+print(f"批次采样配置:")
+print(f"  - 总样本数: {n_samples}")
+print(f"  - 批次大小: {batch_size}")
+print(f"  - 批次数量: {n_batches}")
+print(f"  - 最后一批样本数: {n_samples - (n_batches - 1) * batch_size}")
+# 从[-1,1]均匀分布采样theta值
+# === 批次采样函数 ===
+def generate_batch_parameters(batch_start, batch_end):
+    """为指定批次生成参数"""
+    batch_size_actual = batch_end - batch_start
+    
+    # 设置随机种子以确保可重现性
+    np.random.seed(42 + batch_start)
+    random.seed(42 + batch_start)
+    
+    theta_values = np.random.uniform(-0.6, 0.5, batch_size_actual)
+    connection_density_values = np.random.uniform(0.5, 0.7, batch_size_actual)
+    inter_class_boost_values = np.random.uniform(0.1, 0.2, batch_size_actual)
+    num_classes_values = [random.randint(3, 8) for _ in range(batch_size_actual)]
+    
+    return theta_values, connection_density_values, inter_class_boost_values, num_classes_values
+
+def process_single_sample(sample_idx, theta, num_classes, connection_density, inter_class_boost, 
+                         n_nodes, n_features, root_path):
+    """处理单个样本的生成和保存"""
+    print(f"\n--> Sample {sample_idx + 1}: Generating data for theta = {theta:.4f}, num_classes = {num_classes}...")
+    print(f"    connection_density = {connection_density:.4f}, inter_class_boost = {inter_class_boost:.4f}")
+    
+    try:
+        # 生成参数
+        Lambda, mu = _parameterized_multi_class(theta, p=n_features, n=n_nodes, num_classes=num_classes)
+        print(f"    Lambda = {Lambda:.4f}, mu = {mu:.4f}")
+        
+        # 生成图数据
+        raw_data_object = _multi_class_context_sbm_lpm(
+            n=n_nodes, 
+            Lambda=Lambda, 
+            p=n_features, 
+            mu=mu, 
+            num_classes=num_classes,
+            connection_density=connection_density,
+            inter_class_boost=inter_class_boost,
+        )
+        
+        if raw_data_object is None:
+            print(f"    ERROR: Function returned None for sample {sample_idx + 1}!")
+            return None
+        
+        # 保存数据
+        raw_file_name = f"multi_class_csbm_theta_{theta:.4f}_classes_{num_classes}_sample_{sample_idx + 1}"
+        pt_file_path = osp.join(root_path, f"{raw_file_name}.pt")
+        torch.save(raw_data_object, pt_file_path)
+        print(f"    Raw data saved to: {pt_file_path}")
+        
+        # 打印统计信息
+        graph_data = raw_data_object
+        print(f"    Sample {sample_idx + 1} - Nodes: {graph_data.num_nodes}, Edges: {graph_data.num_edges}, Features: {graph_data.x.shape[1]}")
+        print(f"    Sample {sample_idx + 1} - Number of classes: {len(torch.unique(graph_data.y))}")
+        
+        # 计算同质性
+        edge_index = graph_data.edge_index.numpy()
+        total_edges = edge_index.shape[1] // 2
+        same_class_edges = 0
+        for e in range(0, edge_index.shape[1], 2):
+            src, dst = edge_index[0, e], edge_index[1, e]
+            if graph_data.y[src] == graph_data.y[dst]:
+                same_class_edges += 1
+        
+        diff_class_edges = total_edges - same_class_edges
+        homophily = same_class_edges / total_edges if total_edges > 0 else 0
+        print(f"    Sample {sample_idx + 1} - Homophily: {homophily:.3f} (Same: {same_class_edges}, Diff: {diff_class_edges})")
+        
+        return {
+            'sample_idx': sample_idx,
+            'theta': theta,
+            'num_classes': num_classes,
+            'connection_density': connection_density,
+            'inter_class_boost': inter_class_boost,
+            'file_path': pt_file_path,
+            'homophily': homophily,
+            'num_nodes': graph_data.num_nodes,
+            'num_edges': graph_data.num_edges
+        }
+        
+    except Exception as e:
+        print(f"    ERROR: Exception occurred for sample {sample_idx + 1}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 # # --- 2. 初始化Google Drive服务 ---
 # print("\n初始化Google Drive服务...")
@@ -136,55 +227,75 @@ print(f"Sampled num_classes values: {num_classes_values}")
 #     drive_service = None
 #     folder_name = None
 
-# --- 3. 为每个theta值和类别数生成图数据 ---
+# --- 3. 批次生成多类别图数据 ---
 root_path = './my_multi_class_datasets'  # 保存路径
-datasets = []
-uploaded_files = []  # 记录上传的文件
 
-for i, (theta, num_classes,connection_density,inter_class_boost) in enumerate(zip(theta_values, num_classes_values,
-                                                                                  connection_density_values,inter_class_boost_values)):
-    print(f"\n--> Step {i+1}: Generating data for theta = {theta:.4f}, num_classes = {num_classes}...")
-    print(f"    connection_density = {connection_density:.4f}, inter_class_boost = {inter_class_boost:.4f}")
+# 确保保存目录存在
+import os
+if not osp.exists(root_path):
+    os.makedirs(root_path)
+
+# 初始化统计信息
+total_generated = 0
+total_failed = 0
+batch_results = []
+
+print(f"\n{'='*60}")
+print(f"开始批次采样生成")
+print(f"{'='*60}")
+
+# 批次处理主循环
+for batch_idx in range(n_batches):
+    batch_start = batch_idx * batch_size
+    batch_end = min((batch_idx + 1) * batch_size, n_samples)
+    current_batch_size = batch_end - batch_start
     
-    try:
-        # 使用 theta 计算 Lambda 和 mu，考虑类别数
-        Lambda, mu = _parameterized_multi_class(theta, p=n_features, n=n_nodes, num_classes=num_classes,
-                                                )
+    print(f"\n{'='*40}")
+    print(f"批次 {batch_idx + 1}/{n_batches}")
+    print(f"样本范围: {batch_start + 1} - {batch_end}")
+    print(f"批次大小: {current_batch_size}")
+    print(f"{'='*40}")
+    
+    # 生成当前批次的参数
+    theta_values, connection_density_values, inter_class_boost_values, num_classes_values = generate_batch_parameters(batch_start, batch_end)
+    
+    # 处理当前批次的每个样本
+    batch_success = 0
+    batch_failed = 0
+    
+    for i, (theta, num_classes, connection_density, inter_class_boost) in enumerate(zip(
+        theta_values, num_classes_values, connection_density_values, inter_class_boost_values)):
         
-        print(f"    Lambda = {Lambda:.4f}, mu = {mu:.4f}")
-        
-        # 生成多类别 cSBM 图数据对象
-        raw_data_object = _multi_class_context_sbm_lpm(
-            n=n_nodes, 
-            Lambda=Lambda, 
-            p=n_features, 
-            mu=mu, 
-            num_classes=num_classes,
-            connection_density=connection_density,
-            inter_class_boost=inter_class_boost,
+        sample_idx = batch_start + i
+        result = process_single_sample(
+            sample_idx, theta, num_classes, connection_density, inter_class_boost,
+            n_nodes, n_features, root_path
         )
         
-        if raw_data_object is None:
-            print("    ERROR: Function returned None!")
-            continue
-            
-    except Exception as e:
-        print(f"    ERROR: Exception occurred: {e}")
-        import traceback
-        traceback.print_exc()
-        continue
+        if result is not None:
+            batch_results.append(result)
+            batch_success += 1
+            total_generated += 1
+        else:
+            batch_failed += 1
+            total_failed += 1
     
-    # 设置保存的根目录和文件名
-    raw_file_name = f"multi_class_csbm_theta_{theta:.4f}_classes_{num_classes}"
+    # 批次完成统计
+    print(f"\n批次 {batch_idx + 1} 完成:")
+    print(f"  - 成功生成: {batch_success}/{current_batch_size}")
+    print(f"  - 失败: {batch_failed}/{current_batch_size}")
+    print(f"  - 成功率: {batch_success/current_batch_size:.1%}")
     
-    # 创建保存目录
-    save_dir = osp.join(root_path)
-    #os.makedirs(save_dir, exist_ok=True)
+    # 内存清理（Python垃圾回收）
+    import gc
+    gc.collect()
     
-    # 保存为 PyTorch Geometric .pt 文件
-    pt_file_path = osp.join(save_dir, f"{raw_file_name}.pt")
-    torch.save(raw_data_object, pt_file_path)
-    print(f"Raw data saved to: {pt_file_path}")
+    # 显示总体进度
+    progress = (batch_idx + 1) / n_batches
+    print(f"\n总体进度: {progress:.1%} ({batch_idx + 1}/{n_batches} 批次完成)")
+    print(f"累计生成: {total_generated} 个样本")
+    if total_failed > 0:
+        print(f"累计失败: {total_failed} 个样本")
     
     # # 上传到Google Drive并删除本地文件
     # if drive_service is not None:
@@ -208,225 +319,52 @@ for i, (theta, num_classes,connection_density,inter_class_boost) in enumerate(zi
     # else:
     #     print(f"跳过上传，文件保存在本地: {pt_file_path}")
     
-    # 验证生成的数据
-    graph_data = raw_data_object
-    print(f"Dataset {i+1} - Nodes: {graph_data.num_nodes}, Edges: {graph_data.num_edges}, Features: {graph_data.x.shape[1]}")
-    print(f"Dataset {i+1} - Number of classes: {len(torch.unique(graph_data.y))}")
-    
-    # 打印每个类别的节点数量
-    for c in range(num_classes):
-        class_count = (graph_data.y == c).sum().item()
-        print(f"  - Class {c}: {class_count} nodes")
-    
-    
-    # 检查边的分布
-    edge_index = graph_data.edge_index.numpy()
-    total_edges = edge_index.shape[1] // 2  # 因为是无向图，所以除以2
-    
-    # 计算同类边和异类边的数量
-    same_class_edges = 0
-    for e in range(0, edge_index.shape[1], 2):  # 每两条边（因为是无向图）
-        src, dst = edge_index[0, e], edge_index[1, e]
-        if graph_data.y[src] == graph_data.y[dst]:
-            same_class_edges += 1
-    
-    diff_class_edges = total_edges - same_class_edges
-    print(f"Dataset {i+1} - Same class edges: {same_class_edges} ({same_class_edges/total_edges:.2%}), "
-          f"Different class edges: {diff_class_edges} ({diff_class_edges/total_edges:.2%})")
-    
-    # 将数据添加到数据集列表
-    datasets.append(raw_data_object)
-    
-    # 可视化图结构（仅对小图或采样的子图进行可视化）
-    if n_nodes <= 1000:  # 对于较大的图，可以考虑采样一个子图
-        try:
-            # 将PyG数据转换为NetworkX图
-            G = to_networkx(raw_data_object, to_undirected=True)
-            
-            # 处理节点采样和颜色
-            sampled_nodes = None
-            if n_nodes > 100:
-                nodes = list(G.nodes())
-                sampled_nodes = random.sample(nodes, 100)  # 采样100个节点
-                G = G.subgraph(sampled_nodes)
-                node_colors = [int(raw_data_object.y[n].item()) for n in sampled_nodes]
-                print(f"    采样了 {len(sampled_nodes)} 个节点用于可视化")
-            else:
-                node_colors = [int(raw_data_object.y[n].item()) for n in range(raw_data_object.num_nodes)]
-            
-            # 创建图形 - 左右对比：潜在坐标 vs Spring布局
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
-            
-            # === 左图：使用潜在坐标布局 ===
-            pos_latent = {}
-            
-            # 获取和处理潜在坐标
-            if hasattr(raw_data_object, 'latent_pos') and raw_data_object.latent_pos is not None:
-                latent_coords = raw_data_object.latent_pos.numpy() if hasattr(raw_data_object.latent_pos, 'numpy') else raw_data_object.latent_pos
-                
-                print(f"    潜在空间维度: {latent_coords.shape[1]}D")
-                
-                # 根据潜在空间维度处理坐标
-                if latent_coords.shape[1] == 2:
-                    # 2D潜在空间，直接使用
-                    if sampled_nodes is not None:
-                        for i, node in enumerate(sampled_nodes):
-                            pos_latent[i] = latent_coords[node]
-                    else:
-                        for i in range(len(latent_coords)):
-                            pos_latent[i] = latent_coords[i]
-                    print(f"    直接使用2D潜在坐标")
-                else:
-                    # 高维潜在空间，使用PCA降维到2D
-                    from sklearn.decomposition import PCA
-                    pca = PCA(n_components=2)
-                    
-                    if sampled_nodes is not None:
-                        # 对采样节点的潜在坐标进行PCA
-                        sampled_coords = latent_coords[sampled_nodes]
-                        coords_2d = pca.fit_transform(sampled_coords)
-                        for i in range(len(coords_2d)):
-                            pos_latent[i] = coords_2d[i]
-                    else:
-                        # 对所有节点进行PCA
-                        coords_2d = pca.fit_transform(latent_coords)
-                        for i in range(len(coords_2d)):
-                            pos_latent[i] = coords_2d[i]
-                    
-                    print(f"    PCA降维: {latent_coords.shape[1]}D -> 2D, 解释方差比: {pca.explained_variance_ratio_.sum():.3f}")
-            else:
-                # 如果没有潜在坐标，使用spring布局作为备选
-                pos_latent = nx.spring_layout(G, seed=42)
-                print("    警告: 没有找到潜在坐标，使用Spring布局代替")
-            
-            # === 右图：使用传统spring布局 ===
-            pos_spring = nx.spring_layout(G, seed=42)
-            
-            # 绘制左图：潜在坐标布局
-            nodes1 = nx.draw_networkx_nodes(G, pos_latent, node_size=40, 
-                                  node_color=node_colors, 
-                                  cmap=plt.cm.Set3, 
-                                  vmin=0, 
-                                  vmax=num_classes-1,
-                                  ax=ax1, alpha=0.8)
-            
-            nx.draw_networkx_edges(G, pos_latent, alpha=0.2, ax=ax1, width=0.5)
-            
-            # 计算同质性用于显示
-            edge_index = raw_data_object.edge_index.numpy()
-            total_edges = edge_index.shape[1] // 2
-            same_class_edges = 0
-            for e in range(0, edge_index.shape[1], 2):
-                src, dst = edge_index[0, e], edge_index[1, e]
-                if raw_data_object.y[src] == raw_data_object.y[dst]:
-                    same_class_edges += 1
-            homophily = same_class_edges / total_edges if total_edges > 0 else 0
-            
-            ax1.set_title(f"潜在坐标布局\n(theta={theta:.3f}, classes={num_classes}, homophily={homophily:.2f})", 
-                         fontsize=12)
-            ax1.set_xlabel("Latent Dimension 1")
-            ax1.set_ylabel("Latent Dimension 2")
-            ax1.grid(True, alpha=0.3)
-            
-            # 绘制右图：Spring布局
-            nodes2 = nx.draw_networkx_nodes(G, pos_spring, node_size=40, 
-                                  node_color=node_colors, 
-                                  cmap=plt.cm.Set3, 
-                                  vmin=0, 
-                                  vmax=num_classes-1,
-                                  ax=ax2, alpha=0.8)
-            
-            nx.draw_networkx_edges(G, pos_spring, alpha=0.2, ax=ax2, width=0.5)
-            
-            ax2.set_title(f"Spring布局\n(theta={theta:.3f}, classes={num_classes}, homophily={homophily:.2f})", 
-                         fontsize=12)
-            ax2.set_xlabel("Spring Layout X")
-            ax2.set_ylabel("Spring Layout Y")
-            ax2.grid(True, alpha=0.3)
-            
-            # 添加颜色条
-            #cbar = plt.colorbar(nodes1, ax=[ax1, ax2], label='Class', shrink=0.8)
-            #cbar.set_ticks(range(num_classes))
-            
-            # 如果有类别中心信息，在潜在坐标图上标出
-            if hasattr(raw_data_object, 'class_centers') and raw_data_object.class_centers is not None:
-                class_centers = raw_data_object.class_centers
-                
-                # 处理类别中心的维度
-                if class_centers.shape[1] == 2:
-                    centers_2d = class_centers
-                elif 'pca' in locals():
-                    # 使用与节点相同的PCA变换
-                    centers_2d = pca.transform(class_centers)
-                else:
-                    centers_2d = class_centers[:, :2]  # 取前两维
-                
-                # 在潜在坐标图上绘制类别中心
-                ax1.scatter(centers_2d[:, 0], centers_2d[:, 1], 
-                           c='red', marker='X', s=200, linewidths=3, 
-                           edgecolors='black', label='Class Centers', alpha=1.0, zorder=10)
-                ax1.legend()
-                
-                print(f"    类别中心已标注在潜在坐标图上")
-            
-            plt.tight_layout()
-            
-            # 保存图像
-            viz_path = osp.join(root_path, f"latent_viz_theta_{theta:.4f}_classes_{num_classes}.png")
-            plt.savefig(viz_path, dpi=300, bbox_inches='tight')
-            plt.close()
-            print(f"潜在坐标对比可视化已保存到: {viz_path}")
-            
-        except Exception as e:
-            print(f"Warning: Could not visualize graph: {e}")
-            import traceback
-            traceback.print_exc()
+# --- 4. 生成完成统计和分析 ---
+print(f"\n{'='*60}")
+print(f"批次生成完成统计")
+print(f"{'='*60}")
 
-# # --- 4. 生成完成报告 ---
-# print(f"\n" + "=" * 60)
-# print(f"数据生成和上传完成报告")
-# print(f"=" * 60)
+print(f"\n总体统计:")
+print(f"  - 目标样本数: {n_samples}")
+print(f"  - 成功生成: {total_generated}")
+print(f"  - 失败数量: {total_failed}")
+print(f"  - 总体成功率: {total_generated/n_samples:.1%}")
 
-# print(f"\n成功生成 {len(datasets)} 个多类别数据集:")
-# for i, (theta, num_classes) in enumerate(zip(theta_values, num_classes_values)):
-#     print(f"  - 数据集 {i+1}: theta = {theta:.4f}, classes = {num_classes}")
-
-# if drive_service is not None and uploaded_files:
-#     print(f"\n✓ Google Drive上传统计:")
-#     print(f"  - 成功上传文件数: {len(uploaded_files)}")
-#     print(f"  - Google Drive文件夹: {folder_name}")
-#     print(f"\n上传的文件详情:")
-#     for item in uploaded_files:
-#         print(f"  • {item['dataset_info']}")
-#         print(f"    文件ID: {item['file_info'].get('id')}")
-#         print(f"    查看链接: {item['file_info'].get('webViewLink')}")
+if batch_results:
+    # 分析生成的数据集
+    print(f"\n数据集分析:")
     
-#     # 保存上传记录
-#     if 'timestamp' in locals():
-#         upload_record = {
-#             'timestamp': timestamp,
-#             'folder_name': folder_name,
-#             'uploaded_files': uploaded_files,
-#             'generation_params': {
-#                 'n_samples': n_samples,
-#                 'n_nodes': n_nodes,
-#                 'n_features': n_features,
-#                 'theta_values': theta_values.tolist(),
-#                 'num_classes_values': num_classes_values
-#             },
-#             'upload_date': datetime.now().isoformat()
-#         }
-        
-#         record_file = f'upload_record_{timestamp}.json'
-#         with open(record_file, 'w', encoding='utf-8') as f:
-#             json.dump(upload_record, f, ensure_ascii=False, indent=2)
-        
-#         print(f"\n上传记录已保存到: {record_file}")
+    # 统计theta分布
+    theta_list = [r['theta'] for r in batch_results]
+    print(f"  - Theta范围: [{min(theta_list):.3f}, {max(theta_list):.3f}]")
+    print(f"  - Theta均值: {np.mean(theta_list):.3f}")
     
-#     print(f"\n✓ 所有本地文件已清理，数据已安全上传到Google Drive!")
-# else:
-#     print(f"\n本地文件保存位置: {root_path}")
-#     if drive_service is None:
-#         print(f"注意: 由于Google Drive认证失败，文件仅保存在本地")
+    # 统计类别数分布
+    classes_list = [r['num_classes'] for r in batch_results]
+    unique_classes = sorted(set(classes_list))
+    print(f"  - 类别数范围: {unique_classes}")
+    for nc in unique_classes:
+        count = classes_list.count(nc)
+        print(f"    * {nc}类: {count} 个数据集 ({count/len(batch_results):.1%})")
+    
+    # 统计同质性分布
+    homophily_list = [r['homophily'] for r in batch_results]
+    print(f"  - 同质性范围: [{min(homophily_list):.3f}, {max(homophily_list):.3f}]")
+    print(f"  - 同质性均值: {np.mean(homophily_list):.3f}")
+    
+    # 统计图大小
+    nodes_list = [r['num_nodes'] for r in batch_results]
+    edges_list = [r['num_edges'] for r in batch_results]
+    print(f"  - 节点数: {nodes_list[0]} (固定)")
+    print(f"  - 边数范围: [{min(edges_list)}, {max(edges_list)}]")
+    print(f"  - 平均边数: {np.mean(edges_list):.1f}")
+    
+    print(f"\n所有数据集已保存到: {root_path}")
+else:
+    print(f"\n警告: 没有成功生成任何数据集!")
+    
 
-# print(f"\n数据生成任务完成!")
+
+print(f"\n{'='*60}")
+print(f"批次采样数据生成任务完成!")
+print(f"{'='*60}")
